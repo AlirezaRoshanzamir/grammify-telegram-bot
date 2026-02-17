@@ -1,6 +1,8 @@
 from pydantic import BaseModel, Field
 from openai import OpenAI
+from openai_cost_calculator import estimate_cost_typed
 import inspect
+from decimal import Decimal
 
 
 class AgentResponse(BaseModel):
@@ -46,7 +48,7 @@ class Agent:
     def __init__(self, client: OpenAI) -> None:
         self._client = client
 
-    def handle(self, text: str) -> AgentResponse:
+    def handle(self, text: str) -> tuple[AgentResponse, Decimal]:
         completion = self._client.chat.completions.parse(
             model="gpt-5.2-2025-12-11",
             messages=[
@@ -63,4 +65,6 @@ class Agent:
                 f"Cannot parse reply message as a {AgentResponse.__name__}."
             )
 
-        return reply_message
+        total_cost = estimate_cost_typed(completion).total_cost
+
+        return reply_message, total_cost

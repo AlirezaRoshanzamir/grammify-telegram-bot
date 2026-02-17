@@ -16,6 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from grammify.text_to_image import tagged_text_to_image
 import tempfile
 import pathlib
+from decimal import Decimal
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -30,6 +31,7 @@ class AppSettings(BaseSettings):
     telegram_bot_token: str
     proxy: str | None = None
     selected_users: list[int]
+    show_cost: bool = False
 
     model_config = SettingsConfigDict(
         env_prefix="GRAMMIFY_", env_file=".env", extra="ignore"
@@ -96,7 +98,9 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-def format_fix_grammar_response(response: AgentResponse) -> str:
+def format_fix_grammar_response(
+    response: AgentResponse, cost: Decimal, show_cost: bool
+) -> str:
     if response.needs_correction:
         result = response.final_corrected_text
 
@@ -113,6 +117,10 @@ def format_fix_grammar_response(response: AgentResponse) -> str:
         result += "<b>Answer:</b>"
         result += "\n"
         result += response.answered_question
+
+    if show_cost:
+        result += "\n\n"
+        result += f"<b>Cost: ${cost}</b>"
 
     if len(result) > constants.MessageLimit.CAPTION_LENGTH:
         result = result[: constants.MessageLimit.CAPTION_LENGTH - 3] + "..."
@@ -159,7 +167,7 @@ async def handle_general_message(
     await message.set_reaction(reaction=constants.ReactionEmoji.EYES)
 
     try:
-        response = fix_grammar_agent.handle(message_text)
+        response, cost = fix_grammar_agent.handle(message_text)
     except Exception as e:
         await message.set_reaction(
             reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS
@@ -173,7 +181,9 @@ async def handle_general_message(
         await message.set_reaction(reaction=constants.ReactionEmoji.WRITING_HAND)
 
     if response.needs_correction or response.answered_question:
-        response_text = format_fix_grammar_response(response)
+        response_text = format_fix_grammar_response(
+            response, cost, app_settings.show_cost
+        )
         try:
             if response.needs_correction:
                 temp_file_pth = tempfile.mktemp(suffix=".png")
@@ -189,7 +199,7 @@ async def handle_general_message(
                     )
                     await message.reply_photo(
                         photo=temp_file_pth,
-                        caption=format_fix_grammar_response(response),
+                        caption=response_text,
                         reply_to_message_id=message.message_id,
                         parse_mode=constants.ParseMode.HTML,
                     )

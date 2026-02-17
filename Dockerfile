@@ -7,7 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y build-essential libffi-dev \
+    && apt-get install --no-install-recommends -y \
+        build-essential \
+        libffi-dev \
+        libfontconfig1 libgl1 libegl1 libglvnd0 libgl1-mesa-dri \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
