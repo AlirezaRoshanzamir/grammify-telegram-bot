@@ -11,9 +11,11 @@ from telegram.ext import (
 )
 from openai import OpenAI
 import httpx
-import inspect
-from pydantic import BaseModel, Field
+from grammify.agent import Agent, AgentResponse
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from grammify.text_to_image import tagged_text_to_image
+import tempfile
+import pathlib
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -26,10 +28,12 @@ logger = logging.getLogger(__name__)
 class AppSettings(BaseSettings):
     openai_token: str
     telegram_bot_token: str
-    proxy: str
+    proxy: str | None = None
     selected_users: list[int]
 
-    model_config = SettingsConfigDict(env_prefix="GRAMMIFY_", env_file=".env")
+    model_config = SettingsConfigDict(
+        env_prefix="GRAMMIFY_", env_file=".env", extra="ignore"
+    )
 
 
 app_settings = AppSettings()
@@ -56,6 +60,8 @@ openai_client = OpenAI(
     api_key=app_settings.openai_token,
     http_client=httpx.Client(proxy=app_settings.proxy) if app_settings.proxy else None,
 )
+
+fix_grammar_agent = Agent(client=openai_client)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -90,24 +96,26 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-class FixGrammarResponse(BaseModel):
-    corrected_text: str = Field(
-        description="The corrected text without any change in the meaning."
-    )
-    need_correction: bool = Field(description="If the input text needs any correction?")
-    notes: list[str] = Field(
-        description="Additional notes about the corrections or any suggestion for improvement."
-    )
+def format_fix_grammar_response(response: AgentResponse) -> str:
+    if response.needs_correction:
+        result = response.final_corrected_text
 
+        if response.correction_notes:
+            result += "\n\n"
+            result += "<b>Notes:</b>"
+            result += "\n"
+            result += "\n".join(f"- {note}" for note in response.correction_notes)
+    else:
+        result = "There's no need of correction."
 
-def format_fix_grammar_response(response: FixGrammarResponse) -> str:
-    result = response.corrected_text
-
-    if response.notes:
+    if response.answered_question:
         result += "\n\n"
-        result += "<b>Notes:</b>"
+        result += "<b>Answer:</b>"
         result += "\n"
-        result += "\n".join(f"- {note}" for note in response.notes)
+        result += response.answered_question
+
+    if len(result) > constants.MessageLimit.CAPTION_LENGTH:
+        result = result[: constants.MessageLimit.CAPTION_LENGTH - 3] + "..."
 
     return result
 
@@ -125,7 +133,20 @@ def should_ignore_message_text(text: str) -> bool:
     return bool(compact_text) and bool(EMOJI_ONLY_PATTERN.fullmatch(compact_text))
 
 
-async def fix_grammar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def escape_text(text: str) -> str:
+    special_chars = "_*[]()~`>#+-=|{}.!"
+    escaped_text = ""
+    for char in text:
+        if char in special_chars:
+            escaped_text += "\\" + char
+        else:
+            escaped_text += char
+    return escaped_text
+
+
+async def handle_general_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     message = update.message or update.edited_message
 
     assert message is not None, "For typing."
@@ -137,28 +158,8 @@ async def fix_grammar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     await message.set_reaction(reaction=constants.ReactionEmoji.EYES)
 
-    system_prompt = inspect.cleandoc(
-        """
-        You are a grammar-correction assistant.
-
-        Correct grammar, punctuation, and spelling only.
-
-        Do NOT ask any questions.
-        Do NOT add new ideas or rewrite for style beyond what is required to correct errors.
-        """
-    )
-
     try:
-        completion = openai_client.chat.completions.parse(
-            model="gpt-5-nano",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message_text},
-            ],
-            response_format=FixGrammarResponse,
-        )
-
-        reply_message: FixGrammarResponse | None = completion.choices[0].message.parsed
+        response = fix_grammar_agent.handle(message_text)
     except Exception as e:
         await message.set_reaction(
             reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS
@@ -166,23 +167,48 @@ async def fix_grammar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text(text=f"I'm sorry, there's an error with backend: {e}")
         return
 
-    if reply_message is None:
-        await message.set_reaction(
-            reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS
-        )
-        await message.reply_text(
-            text="I'm sorry, there's an error with backend models."
-        )
-        return
-
-    if not reply_message.need_correction:
+    if not response.needs_correction:
         await message.set_reaction(reaction=constants.ReactionEmoji.FIRE)
     else:
-        await message.reply_html(
-            text=format_fix_grammar_response(reply_message),
-            reply_to_message_id=message.message_id,
-        )
         await message.set_reaction(reaction=constants.ReactionEmoji.WRITING_HAND)
+
+    if response.needs_correction or response.answered_question:
+        response_text = format_fix_grammar_response(response)
+        try:
+            if response.needs_correction:
+                temp_file_pth = tempfile.mktemp(suffix=".png")
+                try:
+                    tagged_text_to_image(
+                        tagged_text=response.diff_text,
+                        max_letters_in_a_row=70,
+                        each_tag_style={
+                            "b": lambda text: text.color("green"),
+                            "s": lambda text: text.color("red").strikethrough(),
+                        },
+                        output_path=temp_file_pth,
+                    )
+                    await message.reply_photo(
+                        photo=temp_file_pth,
+                        caption=format_fix_grammar_response(response),
+                        reply_to_message_id=message.message_id,
+                        parse_mode=constants.ParseMode.HTML,
+                    )
+                finally:
+                    pathlib.Path(temp_file_pth).unlink(missing_ok=True)
+            else:
+                await message.reply_text(
+                    text=response_text,
+                    reply_to_message_id=message.message_id,
+                    parse_mode=constants.ParseMode.HTML,
+                )
+        except Exception as e:
+            await message.set_reaction(
+                reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS
+            )
+            await message.reply_text(
+                text=f"I'm sorry, there's an error with backend: {e}"
+            )
+            return
 
 
 def start_the_bot() -> None:
@@ -212,7 +238,7 @@ def start_the_bot() -> None:
     application.add_handler(
         MessageHandler(
             filters=users_filter & filters.TEXT & ~filters.COMMAND,
-            callback=fix_grammar,
+            callback=handle_general_message,
         )
     )
 
