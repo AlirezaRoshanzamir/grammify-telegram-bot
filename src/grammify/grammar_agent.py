@@ -5,7 +5,7 @@ import inspect
 from decimal import Decimal
 
 
-class AgentResponse(BaseModel):
+class GrammarAgentResponse(BaseModel):
     needs_correction: bool = Field(
         description="If the input text needs any correction?"
     )
@@ -28,7 +28,7 @@ class AgentResponse(BaseModel):
     )
 
 
-class Agent:
+class GrammarAgent:
     _SYSTEM_PROMPT = inspect.cleandoc("""
         You are a grammar-correction assistant.
 
@@ -45,26 +45,32 @@ class Agent:
         - Do NOT add new ideas or rewrite for style beyond what is required to correct errors.
         """)
 
-    def __init__(self, client: OpenAI) -> None:
+    def __init__(self, client: OpenAI, calculate_cost: bool) -> None:
         self._client = client
+        self._calculate_cost = calculate_cost
 
-    def handle(self, text: str) -> tuple[AgentResponse, Decimal]:
+    def handle(self, text: str) -> tuple[GrammarAgentResponse, Decimal]:
         completion = self._client.chat.completions.parse(
             model="gpt-5.2-2025-12-11",
             messages=[
                 {"role": "system", "content": self._SYSTEM_PROMPT},
                 {"role": "user", "content": text},
             ],
-            response_format=AgentResponse,
+            response_format=GrammarAgentResponse,
         )
 
-        reply_message: AgentResponse | None = completion.choices[0].message.parsed
+        reply_message: GrammarAgentResponse | None = completion.choices[
+            0
+        ].message.parsed
 
         if reply_message is None:
             raise RuntimeError(
-                f"Cannot parse reply message as a {AgentResponse.__name__}."
+                f"Cannot parse reply message as a {GrammarAgentResponse.__name__}."
             )
 
-        total_cost = estimate_cost_typed(completion).total_cost
+        total_cost = Decimal()
+
+        if self._calculate_cost:
+            total_cost = estimate_cost_typed(completion).total_cost
 
         return reply_message, total_cost

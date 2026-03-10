@@ -1,7 +1,7 @@
 import logging
 import re
 
-from telegram import ForceReply, Update, constants
+from telegram import ForceReply, Update, constants, Message
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -11,11 +11,13 @@ from telegram.ext import (
 )
 from openai import OpenAI
 import httpx
-from grammify.agent import Agent, AgentResponse
+from grammify.grammar_agent import GrammarAgent, GrammarAgentResponse
+from grammify.general_agent import GeneralAgent
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from grammify.text_to_image import tagged_text_to_image
 import tempfile
 import pathlib
+import sys
 from decimal import Decimal
 
 logging.basicConfig(
@@ -24,12 +26,15 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+logger.addHandler(logging.StreamHandler(sys.stdout))
 
 
 class AppSettings(BaseSettings):
     openai_token: str
     telegram_bot_token: str
-    proxy: str | None = None
+    telegram_base_url: str | None = None
+    openai_proxy: str | None = None
+    telegram_proxy: str | None = None
     selected_users: list[int]
     show_cost: bool = False
 
@@ -60,10 +65,19 @@ IGNORABLE_EMOJI_CHARS_PATTERN = re.compile(r"[\s\u200d\ufe0e\ufe0f]")
 
 openai_client = OpenAI(
     api_key=app_settings.openai_token,
-    http_client=httpx.Client(proxy=app_settings.proxy) if app_settings.proxy else None,
+    http_client=(
+        httpx.Client(proxy=app_settings.openai_proxy)
+        if app_settings.openai_proxy
+        else None
+    ),
 )
 
-fix_grammar_agent = Agent(client=openai_client)
+grammar_agent = GrammarAgent(
+    client=openai_client, calculate_cost=app_settings.show_cost
+)
+general_agent = GeneralAgent(
+    client=openai_client, calculate_cost=app_settings.show_cost
+)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -98,8 +112,8 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-def format_fix_grammar_response(
-    response: AgentResponse, cost: Decimal, show_cost: bool
+def format_grammar_agent_response(
+    response: GrammarAgentResponse, cost: Decimal, show_cost: bool
 ) -> str:
     if response.needs_correction:
         result = response.final_corrected_text
@@ -128,6 +142,10 @@ def format_fix_grammar_response(
     return result
 
 
+def format_general_agent_response(response: str) -> str:
+    return response.replace("**", "*")
+
+
 def should_ignore_message_text(text: str) -> bool:
     normalized_text = text.strip()
 
@@ -152,7 +170,17 @@ def escape_text(text: str) -> str:
     return escaped_text
 
 
-async def handle_general_message(
+async def set_reaction_if_supported(
+    message: Message, reaction: constants.ReactionEmoji
+) -> None:
+    if (
+        app_settings.telegram_base_url is not None
+        and "telegram" in app_settings.telegram_base_url
+    ):
+        await message.set_reaction(reaction)
+
+
+async def handle_grammar_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     message = update.message or update.edited_message
@@ -164,24 +192,30 @@ async def handle_general_message(
     if should_ignore_message_text(message_text):
         return
 
-    await message.set_reaction(reaction=constants.ReactionEmoji.EYES)
+    await set_reaction_if_supported(
+        message=message, reaction=constants.ReactionEmoji.OK_HAND_SIGN
+    )
 
     try:
-        response, cost = fix_grammar_agent.handle(message_text)
+        response, cost = grammar_agent.handle(message_text)
     except Exception as e:
-        await message.set_reaction(
-            reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS
+        await set_reaction_if_supported(
+            message=message, reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS
         )
         await message.reply_text(text=f"I'm sorry, there's an error with backend: {e}")
         return
 
     if not response.needs_correction:
-        await message.set_reaction(reaction=constants.ReactionEmoji.FIRE)
+        await set_reaction_if_supported(
+            message=message, reaction=constants.ReactionEmoji.FIRE
+        )
     else:
-        await message.set_reaction(reaction=constants.ReactionEmoji.WRITING_HAND)
+        await set_reaction_if_supported(
+            message=message, reaction=constants.ReactionEmoji.WRITING_HAND
+        )
 
     if response.needs_correction or response.answered_question:
-        response_text = format_fix_grammar_response(
+        response_text = format_grammar_agent_response(
             response, cost, app_settings.show_cost
         )
         try:
@@ -212,8 +246,9 @@ async def handle_general_message(
                     parse_mode=constants.ParseMode.HTML,
                 )
         except Exception as e:
-            await message.set_reaction(
-                reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS
+            await set_reaction_if_supported(
+                message=message,
+                reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS,
             )
             await message.reply_text(
                 text=f"I'm sorry, there's an error with backend: {e}"
@@ -221,13 +256,47 @@ async def handle_general_message(
             return
 
 
-def start_the_bot() -> None:
-    application_builder = Application.builder().token(app_settings.telegram_bot_token)
+async def handle_general_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.message or update.edited_message
 
-    if app_settings.proxy:
+    assert message is not None, "For typing."
+
+    message_text = message.text or message.caption or ""
+
+    logger.info(f"A general request with the following text:\n{message_text}")
+
+    try:
+        response, cost = general_agent.handle(message_text)
+
+        await message.reply_text(
+            text=format_general_agent_response(response),
+            reply_to_message_id=message.message_id,
+            parse_mode=constants.ParseMode.HTML,
+        )
+    except Exception as e:
+        await message.reply_text(text=f"I'm sorry, there's an error with backend: {e}")
+        return
+
+
+def start_the_bot() -> None:
+    application_builder = (
+        Application.builder()
+        .token(app_settings.telegram_bot_token)
+        .read_timeout(60.0)
+        .write_timeout(60.0)
+    )
+
+    if app_settings.telegram_base_url:
+        application_builder = application_builder.base_url(
+            app_settings.telegram_base_url
+        )
+
+    if app_settings.telegram_proxy:
         application_builder = application_builder.get_updates_proxy(
-            app_settings.proxy
-        ).proxy(app_settings.proxy)
+            app_settings.telegram_proxy
+        ).proxy(app_settings.telegram_proxy)
 
     application = application_builder.build()
 
@@ -245,9 +314,17 @@ def start_the_bot() -> None:
     application.add_handler(
         CommandHandler(command="users", callback=list_users, filters=users_filter)
     )
+    # application.add_handler(
+    #     MessageHandler(
+    #         # filters=users_filter & filters.TEXT & ~filters.COMMAND,
+    #         filters=None,
+    #         callback=handle_grammar_message,
+    #     )
+    # )
     application.add_handler(
         MessageHandler(
-            filters=users_filter & filters.TEXT & ~filters.COMMAND,
+            # filters=users_filter & filters.TEXT & ~filters.COMMAND,
+            filters=None,
             callback=handle_general_message,
         )
     )
