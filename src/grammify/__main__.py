@@ -14,7 +14,6 @@ import httpx
 from grammify.grammar_agent import GrammarAgent, GrammarAgentResponse
 from grammify.general_agent import GeneralAgent
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from grammify.text_to_image import tagged_text_to_image
 import tempfile
 import pathlib
 import sys
@@ -183,6 +182,8 @@ async def set_reaction_if_supported(
 async def handle_grammar_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    from grammify.text_to_image import tagged_text_to_image
+
     message = update.message or update.edited_message
 
     assert message is not None, "For typing."
