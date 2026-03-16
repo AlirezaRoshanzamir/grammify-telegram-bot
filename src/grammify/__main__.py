@@ -29,10 +29,13 @@ logger.addHandler(logging.StreamHandler(sys.stdout))
 
 
 class AppSettings(BaseSettings):
+    openai_base_url: str | None = None
     openai_token: str
     telegram_bot_token: str
     telegram_base_url: str | None = None
+    telegram_timeout: float | None = 90.0
     openai_proxy: str | None = None
+    max_text_length: int = constants.MessageLimit.MAX_TEXT_LENGTH
     telegram_proxy: str | None = None
     selected_users: list[int]
     show_cost: bool = False
@@ -63,6 +66,7 @@ PERSIAN_LETTER_PATTERN = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]"
 IGNORABLE_EMOJI_CHARS_PATTERN = re.compile(r"[\s\u200d\ufe0e\ufe0f]")
 
 openai_client = OpenAI(
+    base_url=app_settings.openai_base_url,
     api_key=app_settings.openai_token,
     http_client=(
         httpx.Client(proxy=app_settings.openai_proxy)
@@ -93,8 +97,10 @@ async def get_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     assert update.effective_user is not None, "For typing."
     assert update.message is not None, "For typing."
 
-    await update.message.reply_text(
-        str(update.effective_user.id), reply_to_message_id=update.message.message_id
+    await reply_text(
+        message=update.message,
+        text=str(update.effective_user.id),
+        reply_to_message_id=update.message.message_id,
     )
 
 
@@ -106,8 +112,8 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         text = "\n".join(str(user_id) for user_id in app_settings.selected_users)
 
-    await update.message.reply_text(
-        text=text, reply_to_message_id=update.message.message_id
+    await reply_text(
+        message=update.message, text=text, reply_to_message_id=update.message.message_id
     )
 
 
@@ -179,6 +185,24 @@ async def set_reaction_if_supported(
         await message.set_reaction(reaction)
 
 
+async def reply_text(
+    message: Message,
+    text: str,
+    reply_to_message_id: int | None = None,
+    parse_mode: constants.ParseMode = constants.ParseMode.HTML,
+) -> None:
+    parts = [
+        text[i : i + app_settings.max_text_length]
+        for i in range(0, len(text), app_settings.max_text_length)
+    ]
+    for part in parts:
+        await message.reply_text(
+            text=part,
+            reply_to_message_id=reply_to_message_id,
+            parse_mode=parse_mode,
+        )
+
+
 async def handle_grammar_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -203,7 +227,9 @@ async def handle_grammar_message(
         await set_reaction_if_supported(
             message=message, reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS
         )
-        await message.reply_text(text=f"I'm sorry, there's an error with backend: {e}")
+        await reply_text(
+            message=message, text=f"I'm sorry, there's an error with backend: {e}"
+        )
         return
 
     if not response.needs_correction:
@@ -241,7 +267,8 @@ async def handle_grammar_message(
                 finally:
                     pathlib.Path(temp_file_pth).unlink(missing_ok=True)
             else:
-                await message.reply_text(
+                await reply_text(
+                    message=message,
                     text=response_text,
                     reply_to_message_id=message.message_id,
                     parse_mode=constants.ParseMode.HTML,
@@ -251,8 +278,8 @@ async def handle_grammar_message(
                 message=message,
                 reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS,
             )
-            await message.reply_text(
-                text=f"I'm sorry, there's an error with backend: {e}"
+            await reply_text(
+                message=message, text=f"I'm sorry, there's an error with backend: {e}"
             )
             return
 
@@ -271,13 +298,16 @@ async def handle_general_message(
     try:
         response, cost = general_agent.handle(message_text)
 
-        await message.reply_text(
+        await reply_text(
+            message=message,
             text=format_general_agent_response(response),
             reply_to_message_id=message.message_id,
             parse_mode=constants.ParseMode.HTML,
         )
     except Exception as e:
-        await message.reply_text(text=f"I'm sorry, there's an error with backend: {e}")
+        await reply_text(
+            message=message, text=f"I'm sorry, there's an error with backend: {e}"
+        )
         return
 
 
@@ -285,8 +315,11 @@ def start_the_bot() -> None:
     application_builder = (
         Application.builder()
         .token(app_settings.telegram_bot_token)
-        .read_timeout(60.0)
-        .write_timeout(60.0)
+        .read_timeout(app_settings.telegram_timeout)
+        .write_timeout(app_settings.telegram_timeout)
+        .connect_timeout(app_settings.telegram_timeout)
+        .get_updates_read_timeout(app_settings.telegram_timeout)
+        .get_updates_write_timeout(app_settings.telegram_timeout)
     )
 
     if app_settings.telegram_base_url:
