@@ -1,5 +1,6 @@
 import logging
 import re
+from datetime import timedelta
 
 from telegram import ForceReply, Update, constants, Message
 from telegram.ext import (
@@ -83,8 +84,23 @@ general_agent = GeneralAgent(
     client=openai_client, calculate_cost=app_settings.show_cost
 )
 
-consequent_failures: int = 0
+consequent_failures: int | None = None
 liveness_status_sent: bool = False
+
+
+def increase_consequent_failures() -> None:
+    global consequent_failures
+
+    if consequent_failures is None:
+        consequent_failures = 1
+    else:
+        consequent_failures += 1
+
+
+def reset_consequent_failures() -> None:
+    global consequent_failures
+
+    consequent_failures = 0
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -210,8 +226,6 @@ async def reply_text(
 async def handle_grammar_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    global consequent_failures
-
     from grammify.text_to_image import tagged_text_to_image
 
     message = update.message or update.edited_message
@@ -279,9 +293,9 @@ async def handle_grammar_message(
                     reply_to_message_id=message.message_id,
                     parse_mode=constants.ParseMode.HTML,
                 )
-            consequent_failures = 0
+            reset_consequent_failures()
         except Exception as e:
-            consequent_failures += 1
+            increase_consequent_failures()
             await set_reaction_if_supported(
                 message=message,
                 reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS,
@@ -295,8 +309,6 @@ async def handle_grammar_message(
 async def handle_general_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    global consequent_failures
-
     message = update.message or update.edited_message
 
     assert message is not None, "For typing."
@@ -314,9 +326,9 @@ async def handle_general_message(
             reply_to_message_id=message.message_id,
             parse_mode=constants.ParseMode.HTML,
         )
-        consequent_failures = 0
+        reset_consequent_failures()
     except Exception as e:
-        consequent_failures += 1
+        increase_consequent_failures()
         await reply_text(
             message=message, text=f"I'm sorry, there's an error with backend: {e}"
         )
@@ -326,14 +338,27 @@ async def handle_general_message(
 async def send_liveness_status(context: ContextTypes.DEFAULT_TYPE) -> None:
     global liveness_status_sent
 
-    if consequent_failures > 0:
+    if (
+        not liveness_status_sent
+        or consequent_failures is None
+        or consequent_failures > 0
+    ):
         liveness_status_sent = False
-        return
-    
+
+        try:
+            openai_client.models.retrieve("gpt-3.5-turbo")
+            reset_consequent_failures()
+        except Exception as e:
+            increase_consequent_failures()
+            await context.bot.send_message(
+                chat_id=app_settings.admin_user,
+                text=f"Consequent failures: {consequent_failures}, error: {e}",
+            )
+
     if liveness_status_sent:
         return
 
-    notifying_users = [app_settings.admin_user, *app_settings.selected_users]
+    notifying_users = set([app_settings.admin_user, *app_settings.selected_users])
     for user in notifying_users:
         await context.bot.send_message(chat_id=user, text="I'm back :)")
     liveness_status_sent = True
@@ -392,7 +417,11 @@ def start_the_bot() -> None:
     )
 
     if application.job_queue is not None:
-        application.job_queue.run_repeating(send_liveness_status, interval=10)
+        application.job_queue.run_repeating(
+            send_liveness_status,
+            interval=timedelta(minutes=5),
+            first=timedelta(seconds=10),
+        )
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
