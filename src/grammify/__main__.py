@@ -38,6 +38,7 @@ class AppSettings(BaseSettings):
     max_text_length: int = constants.MessageLimit.MAX_TEXT_LENGTH
     telegram_proxy: str | None = None
     selected_users: list[int]
+    admin_user: int
     show_cost: bool = False
 
     model_config = SettingsConfigDict(
@@ -81,6 +82,9 @@ grammar_agent = GrammarAgent(
 general_agent = GeneralAgent(
     client=openai_client, calculate_cost=app_settings.show_cost
 )
+
+consequent_failures: int = 0
+liveness_status_sent: bool = False
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -206,6 +210,8 @@ async def reply_text(
 async def handle_grammar_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    global consequent_failures
+
     from grammify.text_to_image import tagged_text_to_image
 
     message = update.message or update.edited_message
@@ -273,7 +279,9 @@ async def handle_grammar_message(
                     reply_to_message_id=message.message_id,
                     parse_mode=constants.ParseMode.HTML,
                 )
+            consequent_failures = 0
         except Exception as e:
+            consequent_failures += 1
             await set_reaction_if_supported(
                 message=message,
                 reaction=constants.ReactionEmoji.PERSON_WITH_FOLDED_HANDS,
@@ -287,6 +295,8 @@ async def handle_grammar_message(
 async def handle_general_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    global consequent_failures
+
     message = update.message or update.edited_message
 
     assert message is not None, "For typing."
@@ -304,11 +314,29 @@ async def handle_general_message(
             reply_to_message_id=message.message_id,
             parse_mode=constants.ParseMode.HTML,
         )
+        consequent_failures = 0
     except Exception as e:
+        consequent_failures += 1
         await reply_text(
             message=message, text=f"I'm sorry, there's an error with backend: {e}"
         )
         return
+
+
+async def send_liveness_status(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global liveness_status_sent
+
+    if consequent_failures > 0:
+        liveness_status_sent = False
+        return
+    
+    if liveness_status_sent:
+        return
+
+    notifying_users = [app_settings.admin_user, *app_settings.selected_users]
+    for user in notifying_users:
+        await context.bot.send_message(chat_id=user, text="I'm back :)")
+    liveness_status_sent = True
 
 
 def start_the_bot() -> None:
@@ -363,6 +391,8 @@ def start_the_bot() -> None:
         )
     )
 
+    if application.job_queue is not None:
+        application.job_queue.run_repeating(send_liveness_status, interval=10)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
